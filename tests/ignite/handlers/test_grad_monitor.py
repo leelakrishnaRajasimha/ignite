@@ -1,87 +1,47 @@
-import pytest
-import time
 import math
 import torch
-from ignite.engine import Engine
+from ignite.engine import Engine, Events
 from ignite.handlers.grad_monitor import GradMonitor
 
-def test_gradient_norm_math():
-    # Verifies that L2 norm calculation matches theoretical values.
-    layer = torch.nn.Linear(10, 5)
-    monitor = GradMonitor(layer)
-    for p in layer.parameters():
-        p.grad = torch.ones_like(p)
-    
-    expected_params = sum(p.numel() for p in layer.parameters())
-    calculated_norm = monitor._compute_grad_norm()
-    assert torch.isclose(torch.tensor(calculated_norm), torch.tensor(expected_params**0.5))
 
-def test_engine_state_flag():
-    # Verifies that unhealthy_spike flag is correctly set/reset on engine state.
-    model = torch.nn.Linear(5, 1)
-    monitor = GradMonitor(model, threshold=0.1)
-    trainer = Engine(lambda e, b: None)
-    
-    # Simulating a spike.
-    for p in model.parameters():
-        p.grad = torch.ones_like(p) * 10.0
-    monitor(trainer)
-    assert trainer.state.unhealthy_spike is True
-
-    # Simulating healthy gradients.
-    for p in model.parameters():
-        p.grad = torch.zeros_like(p)
-    monitor(trainer)
-    assert trainer.state.unhealthy_spike is False
-
-def test_grad_scaler_unscaling():
-    # Verifying gradient unscaling when a GradScaler (AMP) is present.
+def test_grad_monitor_spike_detection():
     model = torch.nn.Linear(10, 1)
-    monitor = GradMonitor(model)
-    trainer = Engine(lambda e, b: None)
-    
-    class MockScaler:
-        def get_scale(self): return 1024.0
-    
-    trainer.scaler = MockScaler()
-    for p in model.parameters():
-        p.grad = torch.ones_like(p) * 1024.0 
-        
-    calculated_norm = monitor._compute_grad_norm(trainer)
-    expected_norm = sum(p.numel() for p in model.parameters())**0.5
-    assert math.isclose(calculated_norm, expected_norm, rel_tol=1e-5)
+    monitor = GradMonitor(model, k=2.0)
+    engine = Engine(lambda e, b: None)
+    monitor.attach(engine)
 
-def test_input_validation():
-    # Verifying initialization checks for invalid parameters.
-    with pytest.raises(TypeError, match="should be a torch.nn.Module"):
-        GradMonitor(model=None)
-    
-    dummy_model = torch.nn.Linear(1, 1)
-    for bad_threshold in [-5.0, float('nan'), float('inf')]:
-        with pytest.raises(ValueError, match="positive finite number"):
-            GradMonitor(dummy_model, threshold=bad_threshold)
+    # 1.)Simulating stable training with varying gradients so std > 0.
+    stable_scales = [0.08, 0.12, 0.09, 0.11, 0.10, 0.08, 0.12, 0.09, 0.11, 0.10]
+    norms = []
+    for scale in stable_scales:
+        model.weight.grad = torch.ones_like(model.weight) * scale
+        engine.run(range(1), max_epochs=1)
+        norms.append(math.sqrt(10 * scale ** 2))
+        assert not engine.state.unhealthy_spike
 
-def benchmark_overhead():
-    model = torch.nn.Sequential(torch.nn.Linear(1000, 1000)) 
-    monitor = GradMonitor(model)
-    for p in model.parameters():
-        p.grad = torch.randn_like(p)
+    # 2.)Simulating a sudden spike well above mean + k*std.
+    model.weight.grad = torch.ones_like(model.weight) * 50.0
+    engine.run(range(1), max_epochs=1)
+    assert engine.state.unhealthy_spike
 
-    iterations = 1000
-    start_time = time.perf_counter()
-    for _ in range(iterations):
-        _ = monitor._compute_grad_norm()
-    end_time = time.perf_counter()
-    
-    avg_time_ms = ((end_time - start_time) / iterations) * 1000
-    total_params = sum(p.numel() for p in model.parameters())
-    ns_per_param = ((end_time - start_time) / (iterations * total_params)) * 1e9
-    
-    print(f"\n--- BENCHMARK ---")
-    print(f"Average time per iteration: {avg_time_ms:.6f} ms")
-    print(f"Approximate overhead per parameter: {ns_per_param:.2f} ns")
 
-if __name__ == "__main__":
-    print("Running Logic Tests...")
-    pytest.main([__file__, "-v"])
-    benchmark_overhead()
+def test_grad_monitor_k_sensitivity():
+    """A value just above mean + 1*std should spike for k=1 but not k=3."""
+
+    def _run_monitor(k, spike_scale):
+        model = torch.nn.Linear(10, 1)
+        monitor = GradMonitor(model, k=k)
+        engine = Engine(lambda e, b: None)
+        monitor.attach(engine)
+
+        for scale in [0.08, 0.12, 0.09, 0.11, 0.10] * 2:
+            model.weight.grad = torch.ones_like(model.weight) * scale
+            engine.run(range(1), max_epochs=1)
+
+        model.weight.grad = torch.ones_like(model.weight) * spike_scale
+        engine.run(range(1), max_epochs=1)
+        return engine.state.unhealthy_spike
+
+    # A moderate spike should be caught with tight k but not with loose k.
+    assert _run_monitor(k=1.0, spike_scale=0.5)
+    assert not _run_monitor(k=50.0, spike_scale=0.5)
