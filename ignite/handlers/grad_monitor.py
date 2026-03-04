@@ -15,13 +15,22 @@ class GradMonitor:
         .. code-block:: python
 
             monitor = GradMonitor(model)
-            monitor.attach(trainer)  # Attach first so it runs before the check
+            monitor.attach(trainer)
 
-            @trainer.on(Events.ITERATION_STARTED)
-            def check_spike(engine):
-                # The training step logic must check this flag to skip
+            # Defining a custom train step that respects the spike flag.
+            def custom_train_step(engine, batch):
+                # GradMonitor has already run because it's attached to ITERATION_STARTED
                 if getattr(engine.state, "unhealthy_spike", False):
-                    optimizer.zero_grad()
+                    # Skip the entire forward/backward pass for this batch
+                    return {"skipped": True}
+                
+                # Normal training logic.
+                model.train()
+                optimizer.zero_grad()
+                # ... forward/backward/step ...
+                return {"loss": loss.item()}
+
+            trainer = Engine(custom_train_step)
 
     .. versionadded:: 0.6.0
     """
@@ -29,13 +38,16 @@ class GradMonitor:
     def __init__(self, model: torch.nn.Module, k: float = 3.0):
         self.model = model
         self.k = k
+        self.device = None
         self.count = 0
         self.mean = 0.0
         self.m2 = 0.0 
 
     def __call__(self, engine: Engine):
-        device = next(self.model.parameters()).device
-        total_norm_sq = torch.tensor(0.0, device=device)
+        if self.device is None:
+            self.device = next(self.model.parameters()).device
+
+        total_norm_sq = torch.tensor(0.0, device=self.device)
         
         for p in self.model.parameters():
             if p.grad is not None:
